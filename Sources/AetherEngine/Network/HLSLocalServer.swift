@@ -328,6 +328,11 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private var listenFd: Int32 = -1
     private var shouldStop = false
+    /// Filmio: bumped by every `start()`. A server restarted after a background park (see
+    /// `AetherEngine.parkForBackground`) must not leave the previous accept loop running on the
+    /// new listener: `stop()` sets `shouldStop` and `start()` clears it again, so the flag alone
+    /// cannot tell the old loop it is retired.
+    private var acceptGeneration = 0
     private var clientFds = Set<Int32>()
 
     /// Active connection count; engine memory probe watches for unexpectedly rising accumulation (AVPlayer normally holds 1-3 connections).
@@ -467,7 +472,20 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    func start() throws {
+    /// - Parameter preferredPort: Filmio: the port to listen on again after a background park, so
+    ///   the URLs already handed to AVPlayer stay valid. Falls back to an ephemeral port when it is
+    ///   taken; callers read `port` afterwards.
+    func start(preferredPort: UInt16 = 0) throws {
+        if preferredPort != 0 {
+            do { return try listen(onPort: preferredPort) } catch {
+                EngineLog.emit("[HLSLocalServer] port \(preferredPort) unavailable (\(error)); taking an ephemeral one",
+                               category: .hlsServer)
+            }
+        }
+        try listen(onPort: 0)
+    }
+
+    private func listen(onPort requestedPort: UInt16) throws {
         // SOCK_STREAM = TCP, IPPROTO_TCP = 6.
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else {
@@ -488,7 +506,7 @@ final class HLSLocalServer: @unchecked Sendable {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0 // kernel picks ephemeral
+        addr.sin_port = requestedPort.bigEndian // 0: kernel picks ephemeral
         // Bind all interfaces (not just loopback) so an AirPlay receiver can reach the stream over the LAN
         // via the device's WiFi IP (#86, DrHurt). Local playback still uses 127.0.0.1; the URL host is only
         // swapped to the LAN IP while external playback is active. Ephemeral port, serves the current stream only.
@@ -510,7 +528,7 @@ final class HLSLocalServer: @unchecked Sendable {
         }
 
         // backlog=16 is plenty: AVPlayer typically opens 1-3 conns.
-        guard listen(fd, 16) == 0 else {
+        guard Darwin.listen(fd, 16) == 0 else {
             let err = errno
             close(fd)
             throw HLSLocalServerError.listen(errno: err)
@@ -535,12 +553,14 @@ final class HLSLocalServer: @unchecked Sendable {
         listenFd = fd
         port = assignedPort
         shouldStop = false
+        acceptGeneration &+= 1
+        let generation = acceptGeneration
         stateLock.unlock()
 
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
                        category: .hlsServer)
 
-        let accepter = Thread { [weak self] in self?.acceptLoop() }
+        let accepter = Thread { [weak self] in self?.acceptLoop(generation: generation) }
         accepter.name = "com.aetherengine.hls.accept"
         accepter.qualityOfService = .userInitiated
         accepter.start()
@@ -579,10 +599,10 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Accept loop
 
-    private func acceptLoop() {
+    private func acceptLoop(generation: Int) {
         while true {
             stateLock.lock()
-            let stopping = shouldStop
+            let stopping = shouldStop || generation != acceptGeneration
             let fd = listenFd
             stateLock.unlock()
             if stopping || fd < 0 { return }

@@ -921,6 +921,9 @@ public final class AetherEngine: ObservableObject {
     private var backgroundActionOwed = false
     #endif
     #if os(iOS)
+    /// Filmio: a paused native VOD session parked for the background instead of torn down (see
+    /// `parkForBackground`). Nil whenever nothing is parked.
+    private var backgroundPark: BackgroundPark?
     /// #127: pending grace-window teardown (sleep task + the background-task assertion holding it).
     private var backgroundGraceTask: Task<Void, Never>?
     private var backgroundGraceAssertion: UIBackgroundTaskIdentifier = .invalid
@@ -5029,6 +5032,10 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func play() {
+        #if os(iOS)
+        // Filmio: a play from the lock screen or a headset while parked needs its item back first.
+        unparkFromBackground()
+        #endif
         // AetherEngine#164: a VOD parked at its final frame (scrubbed to the end, or paused there)
         // cannot advance; AVPlayer.play() would no-op and leave the button frozen. Rewind to the start
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
@@ -6883,6 +6890,10 @@ public final class AetherEngine: ObservableObject {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
         resumeAfterInterruption = false
+        #if os(iOS)
+        // Filmio: a park belongs to the session being stopped.
+        backgroundPark = nil
+        #endif
         #if os(iOS) || os(tvOS)
         // A deactivation still queued from a previous teardown must not land on this session (#215).
         audioSessionDeactivationTask?.cancel()
@@ -7169,6 +7180,7 @@ public final class AetherEngine: ObservableObject {
                 #if os(iOS)
                 self.cancelBackgroundGraceWindow()
                 self.softwareHost?.exitBackgroundAudioOnly()
+                self.unparkFromBackground()
                 #endif
                 // AE#588: read the flag before clearing it. `didBecomeActive` also follows a resign that
                 // never backgrounded the app (a system alert, a volume HUD), and the user cannot have
@@ -7361,6 +7373,9 @@ public final class AetherEngine: ObservableObject {
     }
 
     private func teardownVideoForBackground() async {
+        #if os(iOS)
+        if backgroundPark != nil || parkForBackground() { return }
+        #endif
         let app = UIApplication.shared
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
         // #357: park the selection first. The foreground reload snapshots at reload time, which on
@@ -7444,7 +7459,7 @@ public final class AetherEngine: ObservableObject {
     private func expireBackgroundGraceNow() {
         backgroundGraceTask?.cancel()
         backgroundGraceTask = nil
-        if isBackgrounded, currentBackgroundAction() == .teardownVideo {
+        if isBackgrounded, currentBackgroundAction() == .teardownVideo, backgroundPark == nil, !parkForBackground() {
             EngineLog.emit("[AetherEngine] background grace assertion expired early, synchronous teardown (#127)", category: .engine)
             captureBackgroundTeardownSelection()   // #357, as in teardownVideoForBackground
             stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
@@ -7452,6 +7467,92 @@ public final class AetherEngine: ObservableObject {
             state = .paused
         }
         endBackgroundGraceAssertion()
+    }
+
+    // MARK: Filmio: background park
+
+    /// What a park keeps to re-attach the item on return.
+    private struct BackgroundPark {
+        let itemURL: URL
+        /// Item-axis position the fresh item mounts at (the same axis `swapItem` takes).
+        let position: Double
+        /// Port the loopback listener was closed on; nil when it was already down.
+        let port: UInt16?
+    }
+
+    /// Whether a paused session in the background may be parked rather than torn down.
+    ///
+    /// Only a native VOD session served from the loopback producer qualifies: that is where the
+    /// segment cache lives, and where the fully buffered title a teardown throws away was costing
+    /// the viewer a cold reopen against the origin on return. Live windows slide while parked, a
+    /// software session holds renderers that do not survive the background, and an external
+    /// playback route reads the server over the LAN; those keep the upstream teardown.
+    nonisolated static func shouldParkForBackground(
+        backend: PlaybackBackend, hasLoopbackSession: Bool, isLive: Bool, externalPlaybackActive: Bool
+    ) -> Bool {
+        backend == .native && hasLoopbackSession && !isLive && !externalPlaybackActive
+    }
+
+    /// Filmio: the wedge-safe background release, without discarding the session.
+    ///
+    /// Upstream tears the whole pipeline down (#127 / #597) and the host reloads on return, which
+    /// re-opens the source and starts the segment cache from empty. This releases only what must
+    /// not cross a suspension: the AVPlayer item (and with it the decode session in mediaserverd)
+    /// and the loopback listener (iOS reclaims a suspended app's listening sockets). The producer,
+    /// the segment cache and the source reader stay; the reader reconnects at its frontier on the
+    /// first read after the suspension, so a partly buffered title keeps filling from where it
+    /// stopped. `unparkFromBackground` restarts the listener and swaps a fresh item in.
+    private func parkForBackground() -> Bool {
+        guard Self.shouldParkForBackground(
+            backend: playbackBackend, hasLoopbackSession: nativeVideoSession != nil,
+            isLive: loadedOptions.isLive,
+            externalPlaybackActive: currentAVPlayer?.isExternalPlaybackActive ?? false),
+              state == .paused,
+              let host = nativeHost, let session = nativeVideoSession,
+              let url = (currentAVPlayer?.currentItem?.asset as? AVURLAsset)?.url else { return false }
+        let position = renderedPositionMirror.get()
+        host.parkItemForBackground()
+        let port = session.suspendServing()
+        backgroundPark = BackgroundPark(itemURL: url, position: position, port: port)
+        EngineLog.emit(
+            "[AetherEngine] background park: item detached at \(String(format: "%.2f", position))s, "
+            + "listener closed (port \(port.map(String.init) ?? "none")); producer and segment cache kept",
+            category: .engine)
+        return true
+    }
+
+    /// Re-attach a parked session: listen again and swap a fresh item in at the parked position.
+    /// Transport stays as the viewer left it (paused); `play()` unparks first when it arrives while
+    /// still parked, e.g. from the lock screen.
+    private func unparkFromBackground() {
+        guard let park = backgroundPark else { return }
+        backgroundPark = nil
+        guard let host = nativeHost, let session = nativeVideoSession else { return }
+        var url = park.itemURL
+        if let port = park.port {
+            do {
+                if let bound = try session.resumeServing(preferredPort: port), bound != port,
+                   var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                    parts.port = Int(bound)
+                    url = parts.url ?? url
+                }
+            } catch {
+                // No listener, no item: fall back to the upstream teardown, which leaves a paused
+                // session with no route for the host to reload at the parked position.
+                EngineLog.emit("[AetherEngine] background unpark: listener did not restart (\(error)); "
+                               + "releasing the session for a reload", category: .engine)
+                captureBackgroundTeardownSelection()
+                stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+                releaseSubtitleProxyForBackground()
+                state = .paused
+                return
+            }
+        }
+        host.swapItem(url: url, startPosition: park.position)
+        EngineLog.emit(
+            "[AetherEngine] background unpark: fresh item at \(String(format: "%.2f", park.position))s on "
+            + "\(url.port.map(String.init) ?? "?"), served from the kept segment cache",
+            category: .engine)
     }
 
     private func cancelBackgroundGraceWindow() {

@@ -2447,6 +2447,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return ScrubThumbnailSource(segmentIndex: seg.index, initData: initData, segmentURL: seg.fileURL)
     }
 
+    /// Filmio: close the loopback listener while the app is parked in the background, keeping the
+    /// producer, the segment cache and the source connection. iOS reclaims a suspended app's
+    /// listening sockets, so a listener left open across the suspension is dead on return.
+    /// Returns the port it listened on, for `resumeServing(preferredPort:)`.
+    func suspendServing() -> UInt16? {
+        guard let srv = subsystemSnapshot().server, srv.port > 0 else { return nil }
+        let port = srv.port
+        srv.stop()
+        return port
+    }
+
+    /// Filmio: listen again after `suspendServing()`, on the same port when it is still free, so
+    /// the playlist URL AVPlayer was given stays valid. Returns the port actually bound.
+    func resumeServing(preferredPort: UInt16) throws -> UInt16? {
+        guard let srv = subsystemSnapshot().server else { return nil }
+        try srv.start(preferredPort: preferredPort)
+        return srv.port
+    }
+
     public func stop() {
         cancelResidentRangesPublish()
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops

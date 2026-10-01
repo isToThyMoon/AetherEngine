@@ -2041,14 +2041,7 @@ final class NativeAVPlayerHost {
         retiredItemDroppedFrames = 0
     }
 
-    private func unloadCurrentItem(inPlaceSwap: Bool = false) {
-        // Invalidating KVO does not cancel callbacks already queued onto the main actor. Retire
-        // their session now so they drop on their `sessionID == sid` guard, including during the
-        // handover gap where the old item is still attached and still producing them.
-        sessionID = 0
-        if !inPlaceSwap {
-            resetDiagnosticCounters()
-        }
+    private func removeItemObservers() {
         if let to = timeObserver {
             avPlayer.removeTimeObserver(to)
             timeObserver = nil
@@ -2069,6 +2062,33 @@ final class NativeAVPlayerHost {
             NotificationCenter.default.removeObserver(obs)
         }
         notificationObservers.removeAll()
+    }
+
+    /// Filmio: drop the paused item for a background park (`AetherEngine.parkForBackground`).
+    ///
+    /// Detaching the item is what releases the decode session in mediaserverd, the one resource
+    /// that must not ride a long suspension. Everything else stays: the published clock, duration,
+    /// readiness and transport state keep the values they stood at, so the engine and its host see
+    /// a paused session rather than a torn-down one, and `swapItem` re-attaches a fresh item at the
+    /// parked position on return. Observers go first so the detach itself publishes nothing.
+    func parkItemForBackground() {
+        sessionID = 0
+        removeItemObservers()
+        playIntent = false
+        avPlayer.pause()
+        avPlayer.replaceCurrentItem(with: nil)
+        playerItem = nil
+    }
+
+    private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        // Invalidating KVO does not cancel callbacks already queued onto the main actor. Retire
+        // their session now so they drop on their `sessionID == sid` guard, including during the
+        // handover gap where the old item is still attached and still producing them.
+        sessionID = 0
+        if !inPlaceSwap {
+            resetDiagnosticCounters()
+        }
+        removeItemObservers()
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
         failure = nil
         didReachEnd = false
