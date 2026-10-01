@@ -754,6 +754,10 @@ public final class AetherEngine: ObservableObject {
     /// 0 restores the immediate teardown. Ignored on tvOS. Keep well under the ~30 s system allowance,
     /// the teardown itself needs ~3.5 s of drain before suspension.
     public var backgroundTeardownGraceSeconds: Double = 15
+    /// Filmio: the longest a background park (see `parkForBackground`) keeps its segment cache. A
+    /// return after longer releases the session the upstream way and the host reloads, so a title
+    /// left overnight does not hold gigabytes of temporary storage. nil keeps it however long.
+    public var backgroundParkMaxDuration: Duration?
 
     /// #127: true once the active session's transport is ready to accept seeks and report real time
     /// (native: AVPlayerItem readyToPlay; SW/audio hosts publish readiness at session start). Hosts
@@ -7478,6 +7482,8 @@ public final class AetherEngine: ObservableObject {
         let position: Double
         /// Port the loopback listener was closed on; nil when it was already down.
         let port: UInt16?
+        /// Continuous so the device's sleep counts: a phone locked overnight is a long park.
+        let parkedAt: ContinuousClock.Instant
     }
 
     /// Whether a paused session in the background may be parked rather than torn down.
@@ -7513,7 +7519,7 @@ public final class AetherEngine: ObservableObject {
         let position = renderedPositionMirror.get()
         host.parkItemForBackground()
         let port = session.suspendServing()
-        backgroundPark = BackgroundPark(itemURL: url, position: position, port: port)
+        backgroundPark = BackgroundPark(itemURL: url, position: position, port: port, parkedAt: .now)
         EngineLog.emit(
             "[AetherEngine] background park: item detached at \(String(format: "%.2f", position))s, "
             + "listener closed (port \(port.map(String.init) ?? "none")); producer and segment cache kept",
@@ -7528,6 +7534,12 @@ public final class AetherEngine: ObservableObject {
         guard let park = backgroundPark else { return }
         backgroundPark = nil
         guard let host = nativeHost, let session = nativeVideoSession else { return }
+        if let limit = backgroundParkMaxDuration, ContinuousClock.now - park.parkedAt > limit {
+            EngineLog.emit("[AetherEngine] background unpark: parked longer than \(limit); releasing the "
+                           + "session and its segment cache for a reload", category: .engine)
+            releaseParkedSession()
+            return
+        }
         var url = park.itemURL
         if let port = park.port {
             do {
@@ -7541,10 +7553,7 @@ public final class AetherEngine: ObservableObject {
                 // session with no route for the host to reload at the parked position.
                 EngineLog.emit("[AetherEngine] background unpark: listener did not restart (\(error)); "
                                + "releasing the session for a reload", category: .engine)
-                captureBackgroundTeardownSelection()
-                stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
-                releaseSubtitleProxyForBackground()
-                state = .paused
+                releaseParkedSession()
                 return
             }
         }
@@ -7553,6 +7562,15 @@ public final class AetherEngine: ObservableObject {
             "[AetherEngine] background unpark: fresh item at \(String(format: "%.2f", park.position))s on "
             + "\(url.port.map(String.init) ?? "?"), served from the kept segment cache",
             category: .engine)
+    }
+
+    /// The upstream background teardown, applied on return: a paused session with no route, which
+    /// the host reloads at the parked position (`reloadAtCurrentPosition`).
+    private func releaseParkedSession() {
+        captureBackgroundTeardownSelection()
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        releaseSubtitleProxyForBackground()
+        state = .paused
     }
 
     private func cancelBackgroundGraceWindow() {

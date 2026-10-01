@@ -12,6 +12,8 @@ Every change is marked with a `Filmio:` comment. Modified since 2026-10-01:
   listener are released; the producer, the segment cache and the source reader are kept, so a
   buffered title plays from cache on return and an unfinished one keeps filling from its frontier.
   Live, software-decoded and external-playback sessions keep the upstream teardown.
+  `backgroundParkMaxDuration` caps how long a park keeps its cache; a later return releases the
+  session the upstream way and the host reloads.
 - `HLSLocalServer.start(preferredPort:)`: re-listen on the previous port; each start retires the
   previous accept loop.
 - `HLSVideoEngine.suspendServing()` / `resumeServing(preferredPort:)`.
