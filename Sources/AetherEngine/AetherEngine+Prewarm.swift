@@ -63,6 +63,21 @@ public extension AetherEngine {
         SourcePrewarmStore.shared.isWarm(for: url)
     }
 
+    /// Filmio: `probe(url:)` answered from the bytes a prewarm already holds for this URL, with no
+    /// network I/O. Leaves the warm in place for the next `load()`. Returns nil when the URL is not
+    /// warm or the warmed head is not enough to open the container (an MP4 whose `moov` lies past
+    /// the head and was not warmed as the tail); the host can then fall back to `probe(url:)`.
+    nonisolated static func probeWarmed(url: URL) -> SourceProbe? {
+        guard let warm = SourcePrewarmStore.shared.peek(for: url), warm.head.start == 0, !warm.head.isEmpty else {
+            return nil
+        }
+        let reader = WarmedSourceReader(warm: warm)
+        // No byte cap: the reader ends at the warmed spans, and a REMUX with many tracks needs more
+        // than the default 8 MB to resolve every stream. Packet and time caps still apply.
+        return try? probe(source: .custom(reader, formatHint: nil),
+                          limits: ProbeLimits(maxInputBytes: Int64(warm.byteCount) + 1))
+    }
+
     /// Drop every warmed source.
     ///
     /// For a host leaving the context the warms were made for (a user signing out, a server
@@ -71,4 +86,53 @@ public extension AetherEngine {
     nonisolated static func discardPrewarmedSources() {
         SourcePrewarmStore.shared.clear()
     }
+}
+
+
+/// Filmio: a read-only view over a warmed head (and tail, when one was fetched) for `probeWarmed`.
+/// Reads outside the warmed spans end the stream rather than going to the network.
+private final class WarmedSourceReader: IOReader, @unchecked Sendable {
+    private let head: ResidentSpan
+    private let tail: ResidentSpan?
+    private let size: Int64
+    private var position: Int64 = 0
+
+    init(warm: PrewarmedSource) {
+        head = warm.head
+        tail = warm.tail
+        size = warm.contentLength
+    }
+
+    var discImageProbeEnabled: Bool { false }
+
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size count: Int32) -> Int32 {
+        guard let buffer, count > 0 else { return 0 }
+        for span in [head, tail].compactMap({ $0 }) where position >= span.start && position < span.end {
+            let offset = Int(position - span.start)
+            let length = min(Int(count), span.data.count - offset)
+            span.data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                buffer.update(from: base.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: length)
+            }
+            position += Int64(length)
+            return Int32(length)
+        }
+        return 0
+    }
+
+    func seek(offset: Int64, whence: Int32) -> Int64 {
+        let target: Int64
+        switch whence {
+        case 65536: return size // AVSEEK_SIZE
+        case SEEK_SET: target = offset
+        case SEEK_CUR: target = position + offset
+        case SEEK_END: target = size + offset
+        default: return -1
+        }
+        guard target >= 0 else { return -1 }
+        position = target
+        return target
+    }
+
+    func close() {}
 }

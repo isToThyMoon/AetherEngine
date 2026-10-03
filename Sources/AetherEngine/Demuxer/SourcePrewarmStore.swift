@@ -119,6 +119,14 @@ final class SourcePrewarmStore: @unchecked Sendable {
         return hit
     }
 
+    /// Filmio: read an entry without consuming it, so a metadata probe can parse the warmed head and
+    /// the later playback still adopts the same bytes.
+    func peek(for url: URL) -> PrewarmedSource? {
+        let key = url.absoluteString
+        lock.lock(); defer { lock.unlock() }
+        return entries[key]
+    }
+
     /// Whether a source is warm, without consuming it. For diagnostics and tests; the playback path
     /// uses `take`.
     func isWarm(for url: URL) -> Bool {
