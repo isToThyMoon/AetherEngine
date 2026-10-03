@@ -343,6 +343,8 @@ extension AetherEngine {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return nil }
         store.setProtectedStreams(Set(subtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
+        // Filmio: eviction keeps the region around the playhead (see SubtitlePacketStore.setRetentionAnchor).
+        store.setRetentionAnchor(playhead)
         // #416: the pump is rendering the frame at the playhead, so it has necessarily read from
         // wherever it opened up to here. That is what the pump can state without a hook in its read
         // loop, and it is exactly the stretch a landing claim rests on: the ground between a set

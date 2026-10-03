@@ -104,6 +104,12 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// this store gives is only as good as the reading behind it. See `SubtitleHarvestCoverage`.
     private var coverage = SubtitleHarvestCoverage()
     private var protectedStreams: Set<Int32> = []
+    /// Filmio: see `setRetentionAnchor`.
+    private var retentionAnchor: Double?
+    /// Filmio: per stream, the highest PTS evicted from the front, and the sorted PTS of packets
+    /// evicted ahead of the playhead and not harvested again since. See `heldThrough`.
+    private var droppedThroughByStream: [Int32: Double] = [:]
+    private var droppedAheadByStream: [Int32: [Double]] = [:]
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
 
@@ -168,6 +174,76 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return coverage.sortedSpans()
     }
 
+    /// Filmio: the playhead, so eviction can keep the cues that are about to be needed.
+    ///
+    /// Both caps used to evict oldest-PTS-first, which assumes the pump's forward exposure is bounded
+    /// by the producer's forward park (#102). A host that buffers to the end of the file breaks that:
+    /// the pump reads the whole film within minutes and harvests every subtitle packet along the way,
+    /// and a dense bitmap track (PGS "effects" subtitles, 10 to 80 KB per display set) passes the
+    /// 32 MB per-stream cap long before the end. Oldest-first then evicted the stretch right at and
+    /// ahead of the playhead and kept the last hour, so the overlay depended on the forward
+    /// prefetcher, which yields the link to that same producer (60 s yielded, 10 s taken back):
+    /// lines went missing for minutes and arrived late when a burst caught up (device repro: cues at
+    /// 13:40 evicted while the store kept 24:00 to 74:00).
+    ///
+    /// With an anchor, eviction drops packets more than `retentionTrailingSeconds` behind the playhead
+    /// first, then the ones farthest ahead of it, and only then the rest oldest-first. Dropped far-ahead
+    /// packets are re-read by the prefetcher as the playhead approaches them, by which time the producer
+    /// has usually finished and stopped competing for the link. Without an anchor (nothing drained
+    /// yet) eviction is oldest-first as before.
+    func setRetentionAnchor(_ seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        retentionAnchor = seconds
+    }
+
+    /// Filmio: how much behind the playhead survives eviction of the future (short backward seeks).
+    static let retentionTrailingSeconds: Double = 120
+
+    /// Filmio: drop one packet per the anchor policy above; returns the bytes freed. Every drop is
+    /// recorded (see `heldThrough`): a read span is only as complete as what was kept of it.
+    private func evictOneLocked(_ entries: inout [StoredSubtitlePacket], streamIndex: Int32) -> Int {
+        if let anchor = retentionAnchor, let first = entries.first, let last = entries.last,
+           first.ptsSeconds >= anchor - Self.retentionTrailingSeconds, last.ptsSeconds > anchor {
+            let removed = entries.removeLast()
+            var dropped = droppedAheadByStream[streamIndex] ?? []
+            dropped.insert(removed.ptsSeconds, at: Self.lowerBound(dropped, removed.ptsSeconds))
+            droppedAheadByStream[streamIndex] = dropped
+            return removed.payload.count
+        }
+        let removed = entries.removeFirst()
+        droppedThroughByStream[streamIndex] = max(droppedThroughByStream[streamIndex] ?? -.infinity,
+                                                  removed.ptsSeconds)
+        return removed.payload.count
+    }
+
+    /// Filmio: how far from `from` the store holds every packet of the active drain targets, so the
+    /// forward prefetcher can skip reading what is already here. nil when it cannot vouch for `from`
+    /// itself (nothing selected, the span was never read, or a packet there was evicted).
+    ///
+    /// Upstream the prefetcher reads every stretch in front of the playhead whether or not the pump
+    /// already harvested it, and on Matroska that read pulls the video and audio bytes too: a second
+    /// download of the film alongside the one the producer makes (device: ~280 MB in 6 minutes on a
+    /// 6 Mbit/s remux). With buffering to the end, the pump has usually harvested the whole stretch
+    /// already. The answer is the read coverage (`SubtitleHarvestCoverage`) cut at the first packet
+    /// eviction dropped and no reader has put back since.
+    func heldThrough(from: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard !protectedStreams.isEmpty, from.isFinite else { return nil }
+        var reach = from
+        for span in coverage.sortedSpans() where span.through > reach {
+            guard span.from <= reach + SubtitleHarvestCoverage.seamSeconds else { break }
+            reach = span.through
+        }
+        for stream in protectedStreams {
+            if let through = droppedThroughByStream[stream], through >= from { return nil }
+            if let dropped = droppedAheadByStream[stream] {
+                let index = Self.lowerBound(dropped, from)
+                if index < dropped.count { reach = min(reach, dropped[index]) }
+            }
+        }
+        return reach > from ? reach : nil
+    }
+
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                 flags: Int32 = 0, payload: Data, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
@@ -213,9 +289,17 @@ final class SubtitlePacketStore: @unchecked Sendable {
         } else {
             entries.insert(entry, at: probe)
         }
+        // Filmio: a reader put an evicted packet back (see heldThrough).
+        if var dropped = droppedAheadByStream[streamIndex] {
+            let index = Self.lowerBound(dropped, ptsSeconds)
+            if index < dropped.count, dropped[index] == ptsSeconds {
+                dropped.remove(at: index)
+                droppedAheadByStream[streamIndex] = dropped
+            }
+        }
         bytes += payload.count
         while bytes > perStreamCap, entries.count > 1 {
-            bytes -= entries.removeFirst().payload.count
+            bytes -= evictOneLocked(&entries, streamIndex: streamIndex)   // Filmio: was removeFirst (oldest PTS)
         }
         entriesByStream[streamIndex] = entries
         bytesByStream[streamIndex] = bytes
@@ -231,6 +315,17 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// one append O(n) and a session's harvest O(n^2) in retained packets, which #235 turned from
     /// academic into load-bearing, since a dense ASS track now keeps every event on a shared
     /// timestamp instead of collapsing the burst to one entry.
+    /// Filmio: `lowerBound` over a sorted list of PTS.
+    static func lowerBound(_ values: [Double], _ value: Double) -> Int {
+        var low = 0
+        var high = values.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if values[mid] < value { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
     static func lowerBound(_ entries: [StoredSubtitlePacket], _ ptsSeconds: Double) -> Int {
         var low = 0
         var high = entries.count
@@ -260,7 +355,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
             guard var entries = entriesByStream[idx] else { continue }
             var bytes = bytesByStream[idx] ?? 0
             while totalBytes > aggregateCap, !entries.isEmpty {
-                let removed = entries.removeFirst().payload.count
+                let removed = evictOneLocked(&entries, streamIndex: idx)   // Filmio: was removeFirst (oldest PTS)
                 bytes -= removed
                 totalBytes -= removed
             }
@@ -463,6 +558,9 @@ final class SubtitlePacketStore: @unchecked Sendable {
         lastTouchByStream.removeAll()
         protectedStreams.removeAll()
         totalBytes = 0
+        retentionAnchor = nil
+        droppedThroughByStream.removeAll()
+        droppedAheadByStream.removeAll()
         touchCounter = 0
         appendCounter = 0
         coverage = SubtitleHarvestCoverage()

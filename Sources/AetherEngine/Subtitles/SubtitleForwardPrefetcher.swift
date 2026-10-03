@@ -26,6 +26,10 @@ enum SubtitleForwardPrefetcher {
     /// dense track does not take the store's lock per packet for it).
     static let coverageNoteStepSeconds: Double = 0.5
 
+    /// Filmio: a held stretch shorter than this is read through rather than skipped: moving the
+    /// reader is a seek, and on Matroska a seek opens a fresh 32 MiB range.
+    static let heldSkipMinimumSeconds: Double = 30
+
     /// Where a positioning attempt landed. The byte estimate is a fallback, not a failure: the
     /// reader keeps working from wherever it put the cursor, it just cannot trust timestamps.
     enum Positioning: Equatable {
@@ -253,11 +257,58 @@ enum SubtitleForwardPrefetcher {
         /// wall time on purpose, see `SideReaderLinkPolicy.anchorGraceSeconds`.
         var anchorGraceUntil = DispatchTime.now()
             + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
+        /// Filmio: the last read position, and whether the reader is idling on a stretch the store
+        /// already holds (see the skip below).
+        var readPosition: Double? = nil
+        var idling = false
         let telemetryGeneration = SubtitlePrefetchTelemetry.sessionStarted(fence: fence)
         // #220: the exit reason reaches the gauge, not just the fact that the loop stopped.
         // `defer` reads `exit` at unwind, so every break path reports the reason it set.
         defer { SubtitlePrefetchTelemetry.sessionEnded(generation: telemetryGeneration, exit: exit) }
         readLoop: while !Task.isCancelled {
+            // Filmio: do not read what the store already holds. Upstream reads every stretch in front
+            // of the playhead, and on Matroska that pulls the video and audio bytes again: a second
+            // download of the film next to the producer's. When the pump has already harvested (and
+            // the store kept) everything up to the lead edge, idle without touching the link; when
+            // the held stretch ends inside the lead window, or the reader has fallen behind the
+            // playhead, move the reader to where reading is actually needed instead of re-reading
+            // the stretch in between. A pending re-anchor (seek) goes first, as before.
+            if let reanchor, !reanchor.hasPending, let from = readPosition {
+                let probe = max(from, playheadSnapshot)
+                let held = store.heldThrough(from: probe)
+                if let held, held >= playheadSnapshot + leadSeconds {
+                    if !idling {
+                        idling = true
+                        EngineLog.emit(
+                            "[AetherEngine] Filmio: forward prefetch idle, the store holds "
+                            + "\(String(format: "%.2f", probe))s-\(String(format: "%.2f", held))s",
+                            category: .engine)
+                    }
+                    guard let fresh = await playhead() else { break readLoop }
+                    playheadSnapshot = fresh
+                    do { try await Task.sleep(nanoseconds: parkPollNanoseconds) } catch { break readLoop }
+                    continue readLoop
+                }
+                idling = false
+                let resumeAt = held ?? probe
+                if resumeAt > from + heldSkipMinimumSeconds {
+                    let landed = reposition(demuxer: demuxer, to: resumeAt,
+                                            anchorStreamIndex: reanchor.anchorStreamIndex,
+                                            fallbackDuration: reanchor.fallbackDuration,
+                                            timeout: reanchor.seekTimeout)
+                    EngineLog.emit(
+                        "[AetherEngine] Filmio: forward prefetch skipped "
+                        + "\(String(format: "%.2f", from))s-\(String(format: "%.2f", resumeAt))s "
+                        + "(\(held == nil ? "behind the playhead" : "held by the store"), \(landed))",
+                        category: .engine)
+                    store.noteHarvestAnchor(.prefetch, at: resumeAt)
+                    lastCoverageNoted = -Double.infinity
+                    readPosition = nil
+                    anchorGraceUntil = DispatchTime.now()
+                        + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
+                }
+            }
+
             // #240: leave the link to the video path while it needs it. Asked before the read
             // because `readPacket` is what pulls bytes, and on Matroska it pulls the video and audio
             // bytes too. The lead is measured from the last read position, which is what the reader
@@ -319,6 +370,10 @@ enum SubtitleForwardPrefetcher {
                 // request, so this under-claims by up to one authored gap and never over-claims.
                 store.noteHarvestAnchor(.prefetch, at: target.seconds)
                 lastCoverageNoted = -Double.infinity
+                // Filmio: the old read position belongs to the stretch the viewer left; judging the
+                // skip on it after a backward seek would idle the reader on ground it never read.
+                readPosition = nil
+                idling = false
                 anchorGraceUntil = DispatchTime.now()
                     + (link?.anchorGraceSeconds ?? SideReaderLinkPolicy.anchorGraceSeconds)
                 if let fresh = await playhead() { playheadSnapshot = fresh }
@@ -380,6 +435,7 @@ enum SubtitleForwardPrefetcher {
             // (split-set continuation chunks) never parks, its set's PCS anchor already did the
             // pacing.
             guard let position else { continue }
+            readPosition = position   // Filmio: see the skip at the top of the loop
             // #220 gauge: `position` is the read position on the source axis for both packet
             // kinds, a cue PTS for a harvested one and the monotone read DTS for a pacing one,
             // which is the same quantity the park decides on. Since #230 that means
