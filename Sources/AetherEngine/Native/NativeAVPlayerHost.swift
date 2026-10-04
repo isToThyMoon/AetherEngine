@@ -121,6 +121,13 @@ final class NativeAVPlayerHost {
     /// duration, and publishing that transient would bounce the engine through `.paused` and back for
     /// what the viewer must not even notice; the real status is republished when the recovery settles.
     private var prematureEndRecoveryInFlight = false
+    /// Filmio: true from `didPlayToEndTime` until the end is decided (`.ended`, or a #287 recovery takes
+    /// over). AVPlayer pauses itself at item end and that `.paused` arrives while the end check is still
+    /// reading off-main (AE#422); published, it reaches the engine as an ordinary pause before `.ended`,
+    /// and hosts that mirror external pauses into their own play intent then see "the viewer paused"
+    /// (Filmio stopped auto-playing the next episode about one end in six). The end path republishes
+    /// the real status only after `.ended` latched; a recovery republishes it itself.
+    private var endOfItemCheckInFlight = false
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
@@ -688,6 +695,8 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
+                // Filmio: the pause AVPlayer takes at item end is not a pause; `.ended` follows.
+                if status == .paused, self.endOfItemCheckInFlight { return }
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -793,13 +802,22 @@ final class NativeAVPlayerHost {
             queue: .main
         ) { [weak self] _ in
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) didPlayToEndTime", category: .engine)
+            // Filmio: set before AVPlayer's end-of-item `.paused` KVO gets to publish (its Task runs
+            // after this synchronous main-queue delivery), cleared once the end is decided.
+            MainActor.assumeIsolated {
+                if self?.sessionID == sid { self?.endOfItemCheckInFlight = true }
+            }
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
+                defer { if self.sessionID == sid { self.endOfItemCheckInFlight = false } }
                 // AE#287: AVPlayer ends a VOD the moment its video renderer runs dry, even with the
                 // audio-only tail still ahead. Recover before `.ended` latches; it is terminal.
                 if await self.recoverFromPrematureEnd() { return }
                 guard self.sessionID == sid else { return }
                 self.didReachEnd = true
+                // Filmio: the mirror catches up only now, after `.ended` latched (the engine ignores
+                // transport changes from there on).
+                self.timeControlStatus = self.avPlayer.timeControlStatus
             }
         }
         notificationObservers.append(didEndObs)
@@ -2100,6 +2118,7 @@ final class NativeAVPlayerHost {
         prematureEndRecoveryAttempts = 0
         lastPrematureEndRecoveryPlayhead = nil
         prematureEndRecoveryInFlight = false
+        endOfItemCheckInFlight = false
         didSampleSettledRoute = false
         // #168: a reused host must not report the prior session's dynamic range before the new item resolves.
         detectedVideoFormat = nil
