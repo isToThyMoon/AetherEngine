@@ -556,8 +556,11 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
     /// Bounded crash-remnant cleanup, never a recursive search of the caller's temporary root.
     /// Only our UUID-named direct-child directories older than one day are candidates. Keep the
     /// candidate's advisory lease held until removal finishes; age alone never proves abandonment.
+    /// Filmio: `minimumAge` is a parameter (upstream: a fixed day) for the launch sweep
+    /// (`AetherEngine.removeAbandonedPlaybackCaches`); the lease check still decides liveness.
     static func sweepStaleSessionDirs(parentDirectory: URL, currentSession: String? = nil,
-                                     now: Date = Date(), maxEntries: Int = 64,
+                                     now: Date = Date(), minimumAge: TimeInterval = 86_400,
+                                     maxEntries: Int = 64,
                                      maxRemovals: Int = 8) -> StaleSweepResult {
         guard maxEntries > 0, maxRemovals > 0,
               let entries = FileManager.default.enumerator(at: parentDirectory,
@@ -578,7 +581,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             guard lstat(entry.path, &info) == 0 else { failures += 1; continue }
             let modified = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
             guard info.st_mode & S_IFMT == S_IFDIR,
-                  now.timeIntervalSince1970 - modified >= 86_400 else { continue }
+                  now.timeIntervalSince1970 - modified >= minimumAge else { continue }
             let dirFD = open(entry.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard dirFD >= 0 else { failures += 1; continue }
             defer { Darwin.close(dirFD) }

@@ -83,6 +83,12 @@ final class SegmentCache: @unchecked Sendable {
     private var lockFD: Int32 = -1
     private static let liveMarkerName = "session.lock"
 
+    /// Filmio: named so the launch sweep finds the same directory the sessions write to.
+    static var defaultBaseDirectory: URL {
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("aether-segments", isDirectory: true)
+    }
+
     private var _totalBytes: Int = 0
 
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
@@ -123,8 +129,7 @@ final class SegmentCache: @unchecked Sendable {
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
-        let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("aether-segments", isDirectory: true)
+        let baseDir = baseDirectory ?? Self.defaultBaseDirectory
         let sessionID = UUID().uuidString
         self.sessionDir = baseDir.appendingPathComponent(sessionID, isDirectory: true)
         do {
@@ -187,14 +192,19 @@ final class SegmentCache: @unchecked Sendable {
         return true
     }
 
-    private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
+    /// Filmio: `minimumAge` and `now` are parameters (upstream: a fixed hour from the real clock) so
+    /// the launch sweep (`AetherEngine.removeAbandonedPlaybackCaches`) can clear every unheld
+    /// directory a killed process left, instead of waiting for the next session an hour later.
+    /// Internal for that sweep and its tests.
+    static func sweepStaleSessionDirs(baseDir: URL, currentSession: String,
+                                      minimumAge: TimeInterval = 3600, now: Date = Date()) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: baseDir,
                                                         includingPropertiesForKeys: [.creationDateKey],
                                                         options: [.skipsHiddenFiles]) else {
             return
         }
-        let cutoff = Date().addingTimeInterval(-3600)
+        let cutoff = now.addingTimeInterval(-minimumAge)
         for entry in entries where entry.lastPathComponent != currentSession {
             let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
             guard created == nil || created! < cutoff else { continue }

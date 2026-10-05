@@ -1465,7 +1465,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
             + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
             + "forwardWindow=\(forwardWindowSegments) seg"
-            + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "") + ")",
+            + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "")
+            // Filmio: the part of the budget the prefetch leaves to watched segments.
+            + (capRelaxed ? ", history reserve "
+               + "\(PlayedHistoryReserve.reserveBytes(sessionBudgetBytes: retentionBudget) / (1 << 20)) MiB" : "")
+            + ")",
             category: .session
         )
 
@@ -2632,7 +2636,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             packedSideAudioStartPts: packedSideAudioStartPts,
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
             bufferAheadSegments: forwardWindowSegments,
-            prefetchDiskBudgetBytes: retentionBudgetBytes,
+            // Filmio: the prefetch parks short of the full budget, leaving `PlayedHistoryReserve` to
+            // watched segments so a backward seek into them stays a cache hit.
+            prefetchDiskBudgetBytes: PlayedHistoryReserve.forwardBudgetBytes(
+                sessionBudgetBytes: retentionBudgetBytes,
+                capRelaxed: Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)),
             // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
             // arrives; from then on every producer of the session muxes moov from this frame.
             audioMoovPrimeFrame: sessionAudioMoovPrimeFrame,

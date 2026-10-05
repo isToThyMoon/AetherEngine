@@ -34,6 +34,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private let video: Stream
     private let audio: Stream?
     private let byteBudget: Int
+    /// Filmio: unconsumed bytes the producer may hold before it parks (`PlayedHistoryReserve`).
+    /// Below `byteBudget` it leaves the rest to consumed history, which `trimConsumed` would
+    /// otherwise give up to every new packet once the forward read-ahead reached the budget.
+    private let forwardByteBudget: Int
     private let forwardSeconds: Double
     /// Producer thread only. See `start()` for why this is a class the producer moves itself.
     private var producerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
@@ -76,7 +80,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private let maximumKeyframes = 65_536
 
     /// Construct only off-main: creating the FIFO touches the temporary volume.
-    init(video: Stream, audio: Stream?, byteBudget: Int, forwardSeconds: Double,
+    init(video: Stream, audio: Stream?, byteBudget: Int, forwardByteBudget: Int? = nil,
+         forwardSeconds: Double,
          initialSourceClock: Double, fifo: SoftwarePacketDiskFIFO,
          videoReorderDepth: Int? = nil,
          coverageRangeCap: Int = 4096,
@@ -85,6 +90,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         self.video = video
         self.audio = audio
         self.byteBudget = max(1, byteBudget)
+        self.forwardByteBudget = max(1, min(self.byteBudget, forwardByteBudget ?? self.byteBudget))
         self.forwardSeconds = max(1, forwardSeconds)
         self.sourceClock = initialSourceClock
         self.fifo = fifo
@@ -523,6 +529,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         // unbounded batch). Unknown time coverage is never guessed from bitrate.
         guard count > 0 else { return false }
         if residentBytes >= byteBudget { return true }
+        // Filmio: the read-ahead stops short of the budget, so history keeps the remainder.
+        if bytes >= forwardByteBudget { return true }
         // The forward limit is measured on the RESERVOIR, from the packet the consumer last took
         // to the newest one stored, because that is what the producer is actually building and it
         // is knowable from two timestamps. The coverage frontier answers a stricter question (is

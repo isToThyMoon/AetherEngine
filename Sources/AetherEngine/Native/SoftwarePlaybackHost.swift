@@ -976,14 +976,17 @@ final class SoftwarePlaybackHost {
                 let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
                     .volumeAvailableCapacity.map(Int64.init)
                 let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
+                let capRelaxed = HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments)
                 let bytes = HLSVideoEngine.sessionRetentionBudgetBytes(
-                    volumeAvailableBytes: available,
-                    capRelaxed: HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments))
+                    volumeAvailableBytes: available, capRelaxed: capRelaxed)
                 guard bytes > 0 else { return Optional<SoftwarePacketReadAhead>.none }
                 let fifo = try SoftwarePacketDiskFIFO(
                     chunkTargetBytes: min(4 << 20, max(8, bytes)), retainConsumed: true)
                 return SoftwarePacketReadAhead(
                     video: video, audio: audio, byteBudget: bytes,
+                    // Filmio: leave `PlayedHistoryReserve` of the budget to watched packets.
+                    forwardByteBudget: PlayedHistoryReserve.forwardBudgetBytes(
+                        sessionBudgetBytes: bytes, capRelaxed: capRelaxed),
                     forwardSeconds: Double(segments) * 4,
                     initialSourceClock: initialSourceClock, fifo: fifo,
                     videoReorderDepth: videoReorderDepth
