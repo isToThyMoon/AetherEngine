@@ -844,14 +844,19 @@ final class SoftwarePlaybackHost {
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
-            if self.bumpFramesEnqueued() == 0 {
-                self.noteFirstFrameEnqueuedForDisplayFallback()
-                if self.takePausedBeforeFirstFrame() {
-                    // The reorder buffer holds four frames before it hands one to the layer, and the
-                    // loops park again from here: without the drain the frame never leaves it.
-                    self.renderer.drainReorderBuffer()
-                    self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
-                }
+            let isFirstFrame = self.bumpFramesEnqueued() == 0
+            if isFirstFrame { self.noteFirstFrameEnqueuedForDisplayFallback() }
+            // Filmio: checked on every frame, not only the session's first, because a seek that lands
+            // paused raises the same flag (`PausedFirstFrame.holdsForSeekFrame`). The decoder hands
+            // over nothing below the seek's skip threshold, so this is the first frame at the target.
+            if self.takePausedBeforeFirstFrame() {
+                // The reorder buffer holds four frames before it hands one to the layer, and the
+                // loops park again from here: without the drain the frame never leaves it.
+                self.renderer.drainReorderBuffer()
+                self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration,
+                                                 afterSeek: !isFirstFrame)
+            }
+            if isFirstFrame {
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -1145,7 +1150,7 @@ final class SoftwarePlaybackHost {
     /// Sodalite#104 round 4: the first frame of a session paused before it is in. Moves the stopped clock
     /// onto it where it stands before the frame (`PausedFirstFrame.presentationAnchor`). On the main actor,
     /// so a `play()` either runs first and finds the flag gone, or runs after and restarts this clock.
-    nonisolated private func presentFirstFrameUnderPause(pts: Double, generation: UInt64) {
+    nonisolated private func presentFirstFrameUnderPause(pts: Double, generation: UInt64, afterSeek: Bool = false) {
         Task { @MainActor [weak self] in
             guard let self, !self.stopRequested, !self.isPlaying, self.pausedByHost,
                   generation == self.seekGeneration, let aOut = self.audioOutput else { return }
@@ -1156,7 +1161,8 @@ final class SoftwarePlaybackHost {
                 aOut.seekClock(to: CMTime(seconds: anchor, preferredTimescale: 90000), rate: 0)
             }
             EngineLog.emit(
-                "[SWHost] #104 first frame in under the pause: pts=\(String(format: "%.3f", pts))s "
+                (afterSeek ? "[SWHost] Filmio: paused seek frame in: " : "[SWHost] #104 first frame in under the pause: ")
+                + "pts=\(String(format: "%.3f", pts))s "
                 + "clock=\(String(format: "%.3f", clock))s"
                 + (anchor != nil ? ", stopped clock moved onto the frame" : ", presented where the clock stands"),
                 category: .swPlayback
@@ -1390,11 +1396,22 @@ final class SoftwarePlaybackHost {
         if inFlightSeekResumeIntent {
             // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
+            // Filmio: a paused seek this one superseded may have left the hold below raised; a landing
+            // that plays runs the loops anyway, and the hold would drain the reorder buffer early.
+            _ = takePausedBeforeFirstFrame()
             isPlaying = true
         } else {
             // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
+            // Filmio: read on at the stopped clock until the frame at the target is in, then park
+            // (`PausedFirstFrame.holdsForSeekFrame`). Raised before the window closes below, so the
+            // loops it releases already see it.
+            if PausedFirstFrame.holdsForSeekFrame(loopsStarted: demuxLoopStarted, landsPlaying: false,
+                                                  repositionStalled: outcome == .stalled,
+                                                  hasVideo: videoStreamIndex >= 0) {
+                pausedBeforeFirstFrame = true
+            }
         }
         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
         clockArmed = true

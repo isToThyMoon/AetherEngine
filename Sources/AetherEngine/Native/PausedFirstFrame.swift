@@ -17,6 +17,18 @@ enum PausedFirstFrame {
         loopsStarted && framesEnqueued == 0
     }
 
+    /// Filmio: whether a seek that lands paused keeps the loops reading for one frame at the target,
+    /// the same way a pause before the first frame does. Without it the loops park the moment the
+    /// window closes, the flushed layer keeps the pre-seek picture, and a paused scrub shows the old
+    /// position until play (an Emby resume paused right after start, scrubbed ten minutes forward,
+    /// kept showing the resume point). A native session paused at the same moment shows the target.
+    /// A reposition that stalled left the read position undefined, and a source without video has
+    /// no frame to wait for.
+    static func holdsForSeekFrame(loopsStarted: Bool, landsPlaying: Bool, repositionStalled: Bool,
+                                  hasVideo: Bool) -> Bool {
+        loopsStarted && !landsPlaying && !repositionStalled && hasVideo
+    }
+
     /// Whether the loops may read and decode.
     static func loopsMayRun(isPlaying: Bool, pausedBeforeFirstFrame: Bool) -> Bool {
         isPlaying || pausedBeforeFirstFrame
